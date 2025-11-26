@@ -12,6 +12,7 @@ option(USE_CUDA "Enable CUDA support for GPU-accelerated transformations" ON)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_eigen REQUIRED)
@@ -62,6 +63,7 @@ endif()
 ament_target_dependencies(jeeves_pcl_combiner
   rclcpp
   sensor_msgs
+  nav_msgs
   tf2_ros
   tf2_geometry_msgs
   tf2_eigen
