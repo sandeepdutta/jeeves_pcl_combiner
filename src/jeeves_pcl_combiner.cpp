@@ -32,7 +32,6 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <nav_msgs/msg/odometry.hpp>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <pcl_ros/transforms.hpp>
@@ -64,13 +63,9 @@ public:
         // Declare parameters
         this->declare_parameter<std::string>("target_frame", "base_link");
         this->declare_parameter<bool>("use_cuda", false);
-        this->declare_parameter<double>("timestamp_tolerance", 0.1);
-        this->declare_parameter<std::string>("map_frame", "map");
 
         target_frame_ = this->get_parameter("target_frame").as_string();
         use_cuda_ = this->get_parameter("use_cuda").as_bool();
-        timestamp_tolerance_ = this->get_parameter("timestamp_tolerance").as_double();
-        map_frame_ = this->get_parameter("map_frame").as_string();
 
         // Create subscribers for the two point cloud topics
         pc1_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>(this, "/pointcloud1");
@@ -82,11 +77,6 @@ public:
 
         // Publisher for the combined point cloud
         pc_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/combined_pointcloud", 10);
-
-        // Subscribe to odometry topic to get timestamps
-        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/odom", 10,
-            std::bind(&PointCloudCombiner::odom_callback, this, _1));
 
         // Create timer to print statistics every 10 seconds
         stats_timer_ = this->create_wall_timer(
@@ -102,8 +92,6 @@ public:
 
         RCLCPP_INFO(this->get_logger(), "Point cloud combiner initialized");
         RCLCPP_INFO(this->get_logger(), "  Target frame: %s", target_frame_.c_str());
-        RCLCPP_INFO(this->get_logger(), "  Map frame: %s", map_frame_.c_str());
-        RCLCPP_INFO(this->get_logger(), "  Timestamp tolerance: %.3f seconds", timestamp_tolerance_);
         RCLCPP_INFO(this->get_logger(), "  Use CUDA: %s", use_cuda_ ? "true" : "false");
     }
 
@@ -123,18 +111,11 @@ private:
     std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>> pc2_sub_;
     std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_pub_;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
 
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener tf_listener_;
     std::string target_frame_;
-    std::string map_frame_;
-    double timestamp_tolerance_;
     bool use_cuda_;
-
-    // Latest odometry timestamp
-    std::mutex odom_mutex_;
-    builtin_interfaces::msg::Time latest_odom_stamp_;
 
     // Timing statistics
     std::mutex stats_mutex_;
@@ -142,40 +123,6 @@ private:
     std::vector<double> combine_times_;
     std::vector<std::chrono::high_resolution_clock::time_point> publish_timestamps_;
     rclcpp::TimerBase::SharedPtr stats_timer_;
-
-    void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
-    {
-        std::lock_guard<std::mutex> lock(odom_mutex_);
-        latest_odom_stamp_ = msg->header.stamp;
-    }
-
-    bool can_publish_pointcloud(const builtin_interfaces::msg::Time& stamp)
-    {
-        try
-        {
-            // Check if map->base_link transform is available within tolerance
-            tf2::TimePoint time_point(std::chrono::seconds(stamp.sec) +
-                                       std::chrono::nanoseconds(stamp.nanosec));
-
-            if (tf_buffer_.canTransform(map_frame_, target_frame_, time_point,
-                                         tf2::durationFromSec(timestamp_tolerance_)))
-            {
-                return true;
-            }
-            else
-            {
-                RCLCPP_DEBUG(this->get_logger(),
-                            "Dropping point cloud - map->base_link transform not available within tolerance");
-                return false;
-            }
-        }
-        catch (const tf2::TransformException &ex)
-        {
-            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
-                                 "Transform exception when checking if point cloud can be published: %s", ex.what());
-            return false;
-        }
-    }
 
     void sync_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &pc1_msg,
                        const sensor_msgs::msg::PointCloud2::ConstSharedPtr &pc2_msg)
@@ -190,25 +137,11 @@ private:
             sensor_msgs::msg::PointCloud2 transformed_pc2;
             if (transform_pointcloud(pc2_msg, pc2_msg->header.frame_id, transformed_pc2))
             {
-                // Use odometry timestamp if available, otherwise use point cloud timestamp
-                {
-                    std::lock_guard<std::mutex> lock(odom_mutex_);
-                    if (latest_odom_stamp_.sec != 0 || latest_odom_stamp_.nanosec != 0)
-                    {
-                        transformed_pc2.header.stamp = latest_odom_stamp_;
-                    }
-                    // else: keep the original point cloud timestamp
-                }
+                pc_pub_->publish(transformed_pc2);
 
-                // Check if map->base_link transform is available before publishing
-                if (can_publish_pointcloud(transformed_pc2.header.stamp))
-                {
-                    pc_pub_->publish(transformed_pc2);
-
-                    // Record publish timestamp for frequency calculation
-                    std::lock_guard<std::mutex> lock(stats_mutex_);
-                    publish_timestamps_.push_back(std::chrono::high_resolution_clock::now());
-                }
+                // Record publish timestamp for frequency calculation
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                publish_timestamps_.push_back(std::chrono::high_resolution_clock::now());
             }
             return;
         }
@@ -217,25 +150,11 @@ private:
             sensor_msgs::msg::PointCloud2 transformed_pc1;
             if (transform_pointcloud(pc1_msg, pc1_msg->header.frame_id, transformed_pc1))
             {
-                // Use odometry timestamp if available, otherwise use point cloud timestamp
-                {
-                    std::lock_guard<std::mutex> lock(odom_mutex_);
-                    if (latest_odom_stamp_.sec != 0 || latest_odom_stamp_.nanosec != 0)
-                    {
-                        transformed_pc1.header.stamp = latest_odom_stamp_;
-                    }
-                    // else: keep the original point cloud timestamp
-                }
+                pc_pub_->publish(transformed_pc1);
 
-                // Check if map->base_link transform is available before publishing
-                if (can_publish_pointcloud(transformed_pc1.header.stamp))
-                {
-                    pc_pub_->publish(transformed_pc1);
-
-                    // Record publish timestamp for frequency calculation
-                    std::lock_guard<std::mutex> lock(stats_mutex_);
-                    publish_timestamps_.push_back(std::chrono::high_resolution_clock::now());
-                }
+                // Record publish timestamp for frequency calculation
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                publish_timestamps_.push_back(std::chrono::high_resolution_clock::now());
             }
             return;
         }
@@ -299,23 +218,11 @@ private:
             combine_times_.push_back(combine_duration.count());
         }
 
-        // Use odometry timestamp if available, otherwise keep point cloud timestamp
-        {
-            std::lock_guard<std::mutex> lock(odom_mutex_);
-            if (latest_odom_stamp_.sec != 0 || latest_odom_stamp_.nanosec != 0)
-            {
-                combined_pc.header.stamp = latest_odom_stamp_;
-            }
-            // else: combined_pc already has the timestamp from pc1
-        }
+        // Publish the combined point cloud
+        pc_pub_->publish(combined_pc);
 
-        // Check if map->base_link transform is available before publishing
-        if (can_publish_pointcloud(combined_pc.header.stamp))
+        // Record publish timestamp for frequency calculation
         {
-            // Publish the combined point cloud
-            pc_pub_->publish(combined_pc);
-
-            // Record publish timestamp for frequency calculation
             std::lock_guard<std::mutex> lock(stats_mutex_);
             publish_timestamps_.push_back(std::chrono::high_resolution_clock::now());
         }
