@@ -80,7 +80,7 @@ public:
 
         // Create timer to print statistics every 10 seconds
         stats_timer_ = this->create_wall_timer(
-            std::chrono::seconds(10),
+            std::chrono::seconds(60),
             std::bind(&PointCloudCombiner::print_statistics, this));
 
 #ifdef USE_CUDA
