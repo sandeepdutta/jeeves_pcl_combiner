@@ -32,6 +32,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <pcl_ros/transforms.hpp>
@@ -45,6 +46,7 @@
 #include <chrono>
 #include <numeric>
 #include <tf2_eigen/tf2_eigen.hpp>
+#include <cmath>
 
 #ifdef USE_CUDA
 #include "jeeves_pcl_combiner/pointcloud_transform_cuda.hpp"
@@ -63,9 +65,31 @@ public:
         // Declare parameters
         this->declare_parameter<std::string>("target_frame", "base_link");
         this->declare_parameter<bool>("use_cuda", false);
+        this->declare_parameter<bool>("map_frame_sync", false);
+        this->declare_parameter<std::string>("map_frame", "map");
+        this->declare_parameter<double>("timestamp_tolerance", 0.1);
+        this->declare_parameter<bool>("publish_scan", false);
+        this->declare_parameter<double>("scan_height_min", -0.1);
+        this->declare_parameter<double>("scan_height_max", 0.1);
+        this->declare_parameter<double>("scan_range_min", 0.1);
+        this->declare_parameter<double>("scan_range_max", 30.0);
+        this->declare_parameter<double>("scan_angle_min", -M_PI);
+        this->declare_parameter<double>("scan_angle_max", M_PI);
+        this->declare_parameter<double>("scan_angle_increment", 0.0087);  // ~0.5 degrees
 
         target_frame_ = this->get_parameter("target_frame").as_string();
         use_cuda_ = this->get_parameter("use_cuda").as_bool();
+        map_frame_sync_ = this->get_parameter("map_frame_sync").as_bool();
+        map_frame_ = this->get_parameter("map_frame").as_string();
+        timestamp_tolerance_ = this->get_parameter("timestamp_tolerance").as_double();
+        publish_scan_ = this->get_parameter("publish_scan").as_bool();
+        scan_height_min_ = this->get_parameter("scan_height_min").as_double();
+        scan_height_max_ = this->get_parameter("scan_height_max").as_double();
+        scan_range_min_ = this->get_parameter("scan_range_min").as_double();
+        scan_range_max_ = this->get_parameter("scan_range_max").as_double();
+        scan_angle_min_ = this->get_parameter("scan_angle_min").as_double();
+        scan_angle_max_ = this->get_parameter("scan_angle_max").as_double();
+        scan_angle_increment_ = this->get_parameter("scan_angle_increment").as_double();
 
         // Create subscribers for the two point cloud topics
         pc1_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>(this, "/pointcloud1");
@@ -77,6 +101,12 @@ public:
 
         // Publisher for the combined point cloud
         pc_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/combined_pointcloud", 10);
+
+        // Publisher for laser scan (if enabled)
+        if (publish_scan_)
+        {
+            scan_pub_ = this->create_publisher<sensor_msgs::msg::LaserScan>("/scan", 10);
+        }
 
         // Create timer to print statistics every 10 seconds
         stats_timer_ = this->create_wall_timer(
@@ -93,6 +123,18 @@ public:
         RCLCPP_INFO(this->get_logger(), "Point cloud combiner initialized");
         RCLCPP_INFO(this->get_logger(), "  Target frame: %s", target_frame_.c_str());
         RCLCPP_INFO(this->get_logger(), "  Use CUDA: %s", use_cuda_ ? "true" : "false");
+        RCLCPP_INFO(this->get_logger(), "  Map frame sync: %s", map_frame_sync_ ? "enabled" : "disabled");
+        if (map_frame_sync_) {
+            RCLCPP_INFO(this->get_logger(), "  Map frame: %s", map_frame_.c_str());
+            RCLCPP_INFO(this->get_logger(), "  Timestamp tolerance: %.3f seconds", timestamp_tolerance_);
+        }
+        RCLCPP_INFO(this->get_logger(), "  Publish LaserScan: %s", publish_scan_ ? "enabled" : "disabled");
+        if (publish_scan_) {
+            RCLCPP_INFO(this->get_logger(), "    Scan height range: [%.2f, %.2f]", scan_height_min_, scan_height_max_);
+            RCLCPP_INFO(this->get_logger(), "    Scan range: [%.2f, %.2f]", scan_range_min_, scan_range_max_);
+            RCLCPP_INFO(this->get_logger(), "    Scan angle range: [%.2f, %.2f] rad", scan_angle_min_, scan_angle_max_);
+            RCLCPP_INFO(this->get_logger(), "    Scan angle increment: %.4f rad", scan_angle_increment_);
+        }
     }
 
     ~PointCloudCombiner()
@@ -111,11 +153,26 @@ private:
     std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>> pc2_sub_;
     std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_pub_;
 
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener tf_listener_;
     std::string target_frame_;
     bool use_cuda_;
+    bool map_frame_sync_;
+    std::string map_frame_;
+    double timestamp_tolerance_;
+    bool publish_scan_;
+    double scan_height_min_;
+    double scan_height_max_;
+    double scan_range_min_;
+    double scan_range_max_;
+    double scan_angle_min_;
+    double scan_angle_max_;
+    double scan_angle_increment_;
+
+    // Map transform availability tracking
+    bool map_transform_received_{false};
 
     // Timing statistics
     std::mutex stats_mutex_;
@@ -123,6 +180,62 @@ private:
     std::vector<double> combine_times_;
     std::vector<std::chrono::high_resolution_clock::time_point> publish_timestamps_;
     rclcpp::TimerBase::SharedPtr stats_timer_;
+
+    bool can_publish_pointcloud(const builtin_interfaces::msg::Time& stamp)
+    {
+        // If map frame sync is disabled, always allow publishing
+        if (!map_frame_sync_) {
+            return true;
+        }
+
+        // If we haven't received the first map transform yet, silently skip processing
+        if (!map_transform_received_)
+        {
+            // Try to lookup the transform to set the flag
+            try
+            {
+                tf2::TimePoint time_point(std::chrono::seconds(stamp.sec) +
+                                         std::chrono::nanoseconds(stamp.nanosec));
+
+                // Try to actually lookup the transform - if it succeeds, we have map frame
+                geometry_msgs::msg::TransformStamped transform = tf_buffer_.lookupTransform(
+                    map_frame_, target_frame_, time_point,
+                    tf2::durationFromSec(timestamp_tolerance_));
+
+                // If we get here, transform is available
+                map_transform_received_ = true;
+                RCLCPP_INFO(this->get_logger(), "First %s->%s transform received, starting point cloud processing",
+                           map_frame_.c_str(), target_frame_.c_str());
+                return true;
+            }
+            catch (const tf2::TransformException &ex)
+            {
+                // Silently return false on exception - this is expected before SLAM starts
+                return false;
+            }
+        }
+
+        // Once we've seen the map transform at least once, check for availability with normal logging
+        try
+        {
+            // Lookup the transform to verify it's available
+            tf2::TimePoint time_point(std::chrono::seconds(stamp.sec) +
+                                       std::chrono::nanoseconds(stamp.nanosec));
+
+            geometry_msgs::msg::TransformStamped transform = tf_buffer_.lookupTransform(
+                map_frame_, target_frame_, time_point,
+                tf2::durationFromSec(timestamp_tolerance_));
+
+            // Transform successfully looked up
+            return true;
+        }
+        catch (const tf2::TransformException &ex)
+        {
+            RCLCPP_DEBUG(this->get_logger(),
+                        "Dropping point cloud - map->base_link transform not available: %s", ex.what());
+            return false;
+        }
+    }
 
     void sync_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &pc1_msg,
                        const sensor_msgs::msg::PointCloud2::ConstSharedPtr &pc2_msg)
@@ -137,11 +250,22 @@ private:
             sensor_msgs::msg::PointCloud2 transformed_pc2;
             if (transform_pointcloud(pc2_msg, pc2_msg->header.frame_id, transformed_pc2))
             {
-                pc_pub_->publish(transformed_pc2);
+                // Check if map->base_link transform is available before publishing (if enabled)
+                if (can_publish_pointcloud(transformed_pc2.header.stamp))
+                {
+                    pc_pub_->publish(transformed_pc2);
 
-                // Record publish timestamp for frequency calculation
-                std::lock_guard<std::mutex> lock(stats_mutex_);
-                publish_timestamps_.push_back(std::chrono::high_resolution_clock::now());
+                    // Convert and publish laserscan if enabled
+                    if (publish_scan_)
+                    {
+                        sensor_msgs::msg::LaserScan scan = pointcloud_to_laserscan(transformed_pc2);
+                        scan_pub_->publish(scan);
+                    }
+
+                    // Record publish timestamp for frequency calculation
+                    std::lock_guard<std::mutex> lock(stats_mutex_);
+                    publish_timestamps_.push_back(std::chrono::high_resolution_clock::now());
+                }
             }
             return;
         }
@@ -150,11 +274,22 @@ private:
             sensor_msgs::msg::PointCloud2 transformed_pc1;
             if (transform_pointcloud(pc1_msg, pc1_msg->header.frame_id, transformed_pc1))
             {
-                pc_pub_->publish(transformed_pc1);
+                // Check if map->base_link transform is available before publishing (if enabled)
+                if (can_publish_pointcloud(transformed_pc1.header.stamp))
+                {
+                    pc_pub_->publish(transformed_pc1);
 
-                // Record publish timestamp for frequency calculation
-                std::lock_guard<std::mutex> lock(stats_mutex_);
-                publish_timestamps_.push_back(std::chrono::high_resolution_clock::now());
+                    // Convert and publish laserscan if enabled
+                    if (publish_scan_)
+                    {
+                        sensor_msgs::msg::LaserScan scan = pointcloud_to_laserscan(transformed_pc1);
+                        scan_pub_->publish(scan);
+                    }
+
+                    // Record publish timestamp for frequency calculation
+                    std::lock_guard<std::mutex> lock(stats_mutex_);
+                    publish_timestamps_.push_back(std::chrono::high_resolution_clock::now());
+                }
             }
             return;
         }
@@ -218,11 +353,20 @@ private:
             combine_times_.push_back(combine_duration.count());
         }
 
-        // Publish the combined point cloud
-        pc_pub_->publish(combined_pc);
-
-        // Record publish timestamp for frequency calculation
+        // Check if map->base_link transform is available before publishing (if enabled)
+        if (can_publish_pointcloud(combined_pc.header.stamp))
         {
+            // Publish the combined point cloud
+            pc_pub_->publish(combined_pc);
+
+            // Convert and publish laserscan if enabled
+            if (publish_scan_)
+            {
+                sensor_msgs::msg::LaserScan scan = pointcloud_to_laserscan(combined_pc);
+                scan_pub_->publish(scan);
+            }
+
+            // Record publish timestamp for frequency calculation
             std::lock_guard<std::mutex> lock(stats_mutex_);
             publish_timestamps_.push_back(std::chrono::high_resolution_clock::now());
         }
@@ -279,6 +423,73 @@ private:
         combined_pc.data.insert(combined_pc.data.end(), pc2.data.begin(), pc2.data.end());
 
         return combined_pc;
+    }
+
+    sensor_msgs::msg::LaserScan pointcloud_to_laserscan(const sensor_msgs::msg::PointCloud2 &cloud)
+    {
+        sensor_msgs::msg::LaserScan scan;
+        scan.header = cloud.header;
+        scan.angle_min = scan_angle_min_;
+        scan.angle_max = scan_angle_max_;
+        scan.angle_increment = scan_angle_increment_;
+        scan.time_increment = 0.0;
+        scan.scan_time = 0.0;
+        scan.range_min = scan_range_min_;
+        scan.range_max = scan_range_max_;
+
+        // Calculate number of rays
+        int num_rays = static_cast<int>((scan_angle_max_ - scan_angle_min_) / scan_angle_increment_) + 1;
+        scan.ranges.assign(num_rays, std::numeric_limits<float>::infinity());
+        scan.intensities.assign(num_rays, 0.0);
+
+        // Iterate through point cloud
+        sensor_msgs::PointCloud2ConstIterator<float> iter_x(cloud, "x");
+        sensor_msgs::PointCloud2ConstIterator<float> iter_y(cloud, "y");
+        sensor_msgs::PointCloud2ConstIterator<float> iter_z(cloud, "z");
+
+        for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z)
+        {
+            float x = *iter_x;
+            float y = *iter_y;
+            float z = *iter_z;
+
+            // Filter by height
+            if (z < scan_height_min_ || z > scan_height_max_)
+            {
+                continue;
+            }
+
+            // Calculate range and angle
+            float range = std::sqrt(x * x + y * y);
+
+            // Filter by range
+            if (range < scan_range_min_ || range > scan_range_max_)
+            {
+                continue;
+            }
+
+            float angle = std::atan2(y, x);
+
+            // Check if angle is within scan range
+            if (angle < scan_angle_min_ || angle > scan_angle_max_)
+            {
+                continue;
+            }
+
+            // Calculate index in scan array
+            int index = static_cast<int>((angle - scan_angle_min_) / scan_angle_increment_);
+
+            if (index >= 0 && index < num_rays)
+            {
+                // Keep the closest point for each ray
+                if (range < scan.ranges[index])
+                {
+                    scan.ranges[index] = range;
+                }
+            }
+        }
+
+        return scan;
     }
 
     void print_statistics()
