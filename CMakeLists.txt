@@ -2,7 +2,14 @@ cmake_minimum_required(VERSION 3.8)
 project(jeeves_pcl_combiner)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
+  # Scope host warnings to C++: -Wpedantic on CUDA makes the host compiler flag
+  # the line directives in nvcc's generated intermediate files.
+  add_compile_options(
+    "$<$<COMPILE_LANGUAGE:CXX>:-Wall>"
+    "$<$<COMPILE_LANGUAGE:CXX>:-Wextra>"
+    "$<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>"
+    "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>"
+  )
 endif()
 
 # Option to enable CUDA support
@@ -37,6 +44,12 @@ if(USE_CUDA)
   set_target_properties(jeeves_pcl_combiner PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_STANDARD 14
+    CUDA_ARCHITECTURES "87"
+  )
+
+  # Eigen's CUDA headers call constexpr host functions from __host__ __device__ code
+  target_compile_options(jeeves_pcl_combiner PRIVATE
+    "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>"
   )
 
   # Add CUDA compile definition
