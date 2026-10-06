@@ -27,6 +27,8 @@ find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(message_filters REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 
 # Add executable
 if(USE_CUDA)
@@ -83,11 +85,26 @@ ament_target_dependencies(jeeves_pcl_combiner
   pcl_ros
   pcl_conversions
   message_filters
+  geometry_msgs
+)
+
+# Camera tilt estimator (camera IMUs -> per-camera tilt for the combiner)
+add_executable(camera_tilt_estimator src/camera_tilt_estimator.cpp)
+target_include_directories(camera_tilt_estimator PRIVATE ${EIGEN3_INCLUDE_DIR})
+ament_target_dependencies(camera_tilt_estimator
+  rclcpp
+  sensor_msgs
+  nav_msgs
+  geometry_msgs
+  std_srvs
+  tf2_ros
+  tf2_eigen
 )
 
 # Install executables
 install(TARGETS
   jeeves_pcl_combiner
+  camera_tilt_estimator
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -33,6 +33,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
+#include <geometry_msgs/msg/quaternion_stamped.hpp>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <pcl_ros/transforms.hpp>
@@ -47,6 +48,8 @@
 #include <numeric>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <cmath>
+#include <deque>
+#include <map>
 
 #ifdef USE_CUDA
 #include "jeeves_pcl_combiner/pointcloud_transform_cuda.hpp"
@@ -76,6 +79,12 @@ public:
         this->declare_parameter<double>("scan_angle_min", -M_PI);
         this->declare_parameter<double>("scan_angle_max", M_PI);
         this->declare_parameter<double>("scan_angle_increment", 0.0087);  // ~0.5 degrees
+        // Camera tilt correction (from camera_tilt_estimator): rotate each cloud about
+        // its camera mount by the measured tilt before it is used.
+        this->declare_parameter<bool>("tilt_correction", false);
+        this->declare_parameter<std::string>("tilt_topic1", "/ob_front/camera/tilt");
+        this->declare_parameter<std::string>("tilt_topic2", "/ob_back/camera/tilt");
+        this->declare_parameter<double>("tilt_max_age", 0.1);
 
         target_frame_ = this->get_parameter("target_frame").as_string();
         use_cuda_ = this->get_parameter("use_cuda").as_bool();
@@ -90,6 +99,29 @@ public:
         scan_angle_min_ = this->get_parameter("scan_angle_min").as_double();
         scan_angle_max_ = this->get_parameter("scan_angle_max").as_double();
         scan_angle_increment_ = this->get_parameter("scan_angle_increment").as_double();
+        tilt_correction_ = this->get_parameter("tilt_correction").as_bool();
+        tilt_max_age_ = this->get_parameter("tilt_max_age").as_double();
+
+        if (tilt_correction_)
+        {
+            const std::string topics[2] = {this->get_parameter("tilt_topic1").as_string(),
+                                           this->get_parameter("tilt_topic2").as_string()};
+            for (size_t i = 0; i < 2; ++i)
+            {
+                tilt_subs_[i] = this->create_subscription<geometry_msgs::msg::QuaternionStamped>(
+                    topics[i], rclcpp::QoS(50),
+                    [this, i](geometry_msgs::msg::QuaternionStamped::ConstSharedPtr msg) {
+                        std::lock_guard<std::mutex> lock(tilt_mutex_);
+                        auto &buf = tilt_buffers_[i];
+                        buf.push_back(msg);
+                        while (buf.size() > 1 &&
+                               (rclcpp::Time(msg->header.stamp) - rclcpp::Time(buf.front()->header.stamp)).seconds() > 2.0)
+                        {
+                            buf.pop_front();
+                        }
+                    });
+            }
+        }
 
         // Create subscribers for the two point cloud topics
         pc1_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>(this, "/pointcloud1");
@@ -135,6 +167,7 @@ public:
             RCLCPP_INFO(this->get_logger(), "    Scan angle range: [%.2f, %.2f] rad", scan_angle_min_, scan_angle_max_);
             RCLCPP_INFO(this->get_logger(), "    Scan angle increment: %.4f rad", scan_angle_increment_);
         }
+        RCLCPP_INFO(this->get_logger(), "  Tilt correction: %s", tilt_correction_ ? "enabled" : "disabled");
     }
 
     ~PointCloudCombiner()
@@ -170,6 +203,16 @@ private:
     double scan_angle_min_;
     double scan_angle_max_;
     double scan_angle_increment_;
+
+    // Camera tilt correction
+    bool tilt_correction_{false};
+    double tilt_max_age_{0.1};
+    rclcpp::Subscription<geometry_msgs::msg::QuaternionStamped>::SharedPtr tilt_subs_[2];
+    std::deque<geometry_msgs::msg::QuaternionStamped::ConstSharedPtr> tilt_buffers_[2];
+    std::map<std::string, Eigen::Vector3d> pivot_cache_;
+    std::mutex tilt_mutex_;
+    size_t tilt_applied_{0}, tilt_missing_{0};
+    double tilt_max_deg_{0.0};
 
     // Map transform availability tracking
     bool map_transform_received_{false};
@@ -248,7 +291,7 @@ private:
         if (pc1_empty && !pc2_empty)
         {
             sensor_msgs::msg::PointCloud2 transformed_pc2;
-            if (transform_pointcloud(pc2_msg, pc2_msg->header.frame_id, transformed_pc2))
+            if (transform_pointcloud(pc2_msg, pc2_msg->header.frame_id, transformed_pc2, 1))
             {
                 // Check if map->base_link transform is available before publishing (if enabled)
                 if (can_publish_pointcloud(transformed_pc2.header.stamp))
@@ -272,7 +315,7 @@ private:
         else if (pc2_empty && !pc1_empty)
         {
             sensor_msgs::msg::PointCloud2 transformed_pc1;
-            if (transform_pointcloud(pc1_msg, pc1_msg->header.frame_id, transformed_pc1))
+            if (transform_pointcloud(pc1_msg, pc1_msg->header.frame_id, transformed_pc1, 0))
             {
                 // Check if map->base_link transform is available before publishing (if enabled)
                 if (can_publish_pointcloud(transformed_pc1.header.stamp))
@@ -312,11 +355,11 @@ private:
 
         // Launch threads for parallel transformation
         std::thread thread1([this, pc1_msg, sensor_frame_1, &transformed_pc1, &success1]() {
-            success1 = this->transform_pointcloud(pc1_msg, sensor_frame_1, transformed_pc1);
+            success1 = this->transform_pointcloud(pc1_msg, sensor_frame_1, transformed_pc1, 0);
         });
 
         std::thread thread2([this, pc2_msg, sensor_frame_2, &transformed_pc2, &success2]() {
-            success2 = this->transform_pointcloud(pc2_msg, sensor_frame_2, transformed_pc2);
+            success2 = this->transform_pointcloud(pc2_msg, sensor_frame_2, transformed_pc2, 1);
         });
 
         // Wait for both threads to complete
@@ -374,12 +417,17 @@ private:
 
     bool transform_pointcloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &input_cloud,
                               const std::string &source_frame,
-                              sensor_msgs::msg::PointCloud2 &output_cloud)
+                              sensor_msgs::msg::PointCloud2 &output_cloud,
+                              size_t index)
     {
         try
         {
             // Lookup the transform from the sensor frame to the target frame
             geometry_msgs::msg::TransformStamped transform_stamped = tf_buffer_.lookupTransform(target_frame_, source_frame, tf2::TimePointZero);
+            if (tilt_correction_)
+            {
+                apply_tilt(transform_stamped, input_cloud->header.stamp, index);
+            }
 
 #ifdef USE_CUDA
             if (use_cuda_)
@@ -410,6 +458,64 @@ private:
             RCLCPP_WARN(this->get_logger(), "Could not transform point cloud from %s to %s: %s", source_frame.c_str(), target_frame_.c_str(), ex.what());
             return false;
         }
+    }
+
+    // Pre-multiply the static sensor transform by the camera tilt measured closest to
+    // the cloud stamp: p' = o + R (p - o), o = camera mount origin in target_frame.
+    void apply_tilt(geometry_msgs::msg::TransformStamped &transform_stamped,
+                    const builtin_interfaces::msg::Time &stamp, size_t index)
+    {
+        geometry_msgs::msg::QuaternionStamped::ConstSharedPtr best;
+        const rclcpp::Time cloud_time(stamp);
+        {
+            std::lock_guard<std::mutex> lock(tilt_mutex_);
+            double best_dt = tilt_max_age_;
+            for (const auto &sample : tilt_buffers_[index])
+            {
+                const double dt = std::abs((rclcpp::Time(sample->header.stamp) - cloud_time).seconds());
+                if (dt <= best_dt)
+                {
+                    best_dt = dt;
+                    best = sample;
+                }
+            }
+            if (!best)
+            {
+                ++tilt_missing_;
+                return;
+            }
+        }
+
+        Eigen::Vector3d pivot;
+        {
+            std::lock_guard<std::mutex> lock(tilt_mutex_);
+            auto it = pivot_cache_.find(best->header.frame_id);
+            if (it == pivot_cache_.end())
+            {
+                try
+                {
+                    auto tf = tf_buffer_.lookupTransform(target_frame_, best->header.frame_id, tf2::TimePointZero);
+                    it = pivot_cache_.emplace(best->header.frame_id, tf2::transformToEigen(tf.transform).translation()).first;
+                }
+                catch (const tf2::TransformException &ex)
+                {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                         "Tilt pivot frame %s unavailable: %s", best->header.frame_id.c_str(), ex.what());
+                    ++tilt_missing_;
+                    return;
+                }
+            }
+            pivot = it->second;
+        }
+
+        const Eigen::Quaterniond q(best->quaternion.w, best->quaternion.x, best->quaternion.y, best->quaternion.z);
+        const Eigen::Isometry3d tilt = Eigen::Translation3d(pivot) * q.normalized() * Eigen::Translation3d(-pivot);
+        const Eigen::Isometry3d corrected = tilt * tf2::transformToEigen(transform_stamped.transform);
+        transform_stamped.transform = tf2::eigenToTransform(corrected).transform;
+
+        std::lock_guard<std::mutex> lock(tilt_mutex_);
+        ++tilt_applied_;
+        tilt_max_deg_ = std::max(tilt_max_deg_, 2.0 * std::acos(std::min(1.0, std::abs(q.normalized().w()))) * 180.0 / M_PI);
     }
 
     sensor_msgs::msg::PointCloud2 combine_pointclouds(const sensor_msgs::msg::PointCloud2 &pc1, const sensor_msgs::msg::PointCloud2 &pc2)
@@ -539,6 +645,15 @@ private:
                     "  Avg Total Time: %.2f ms", avg_transform + avg_combine);
         RCLCPP_INFO(this->get_logger(),
                     "  Publishing Frequency: %.2f Hz", publish_hz);
+
+        if (tilt_correction_)
+        {
+            std::lock_guard<std::mutex> tilt_lock(tilt_mutex_);
+            RCLCPP_INFO(this->get_logger(), "  Tilt correction: %zu clouds corrected (max %.2f deg), %zu without a tilt sample",
+                        tilt_applied_, tilt_max_deg_, tilt_missing_);
+            tilt_applied_ = tilt_missing_ = 0;
+            tilt_max_deg_ = 0.0;
+        }
 
         // Clear the vectors for next interval
         transform_times_.clear();
