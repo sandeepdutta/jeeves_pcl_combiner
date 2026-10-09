@@ -26,9 +26,10 @@
  * frame (pivot), rotation = nominal -> actual, expressed in base_frame axes:
  *     p_corrected = o + R * (p - o),   o = mount frame origin in base_frame.
  *
- * Note: jeeves_orbbec labels IMU samples <Camera>_accel_frame, but the SDK
- * delivers them in the depth optical axes (x right, y down, z forward), so the
- * axes frame is a parameter (default <Camera>_depth_optical_frame).
+ * Note: the SDK delivers IMU samples in the depth optical axes (x right, y
+ * down, z forward). jeeves_orbbec now labels them <Camera>_accel_optical_frame
+ * (older builds said <Camera>_accel_frame), so the axes frame stays a
+ * parameter (default <Camera>_depth_optical_frame, same orientation).
  *
  * MIT License
  */
